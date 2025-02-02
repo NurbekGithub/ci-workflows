@@ -1,0 +1,97 @@
+name: Docker
+
+on:
+  workflow_call:
+    inputs:
+      build_args:
+        description: "Space-separated environment variables to pass to docker build"
+        type: string
+        default: ""
+        required: false
+      cache:
+        description: "Use previous builds as a cache"
+        type: boolean
+        default: true
+        required: false
+      app:
+        description: "Monorepo app name (if applicable); if provided, build context will be apps/<app>"
+        type: string
+        default: ""
+        required: false
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: "Build"
+        shell: bash
+        run: |
+          echo "Building for repository: ${GITHUB_REPOSITORY}"
+          echo "Reference Type: ${GITHUB_REF_TYPE}, Ref Name: ${GITHUB_REF_NAME}"
+          
+          # Prepare a local clone directory for the repository.
+          repo_dir="repo_$(printf '%s' "${GITHUB_REPOSITORY}" | tr -c 'A-Za-z0-9_-' '_')"
+          if [ -e "${repo_dir}" ] && [ ! -d "${repo_dir}/.git" ]; then
+            rm -rf "${repo_dir}"
+          fi
+          if [ ! -e "${repo_dir}" ]; then
+            git init --quiet "${repo_dir}"
+          fi
+          git -C "${repo_dir}" fetch --depth=1 --force --quiet \
+            "https://${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
+            "${GITHUB_REF}:${GITHUB_REF}"
+          git -C "${repo_dir}" checkout --detach --quiet "${GITHUB_REF}"
+
+          # Determine build context based on the optional "app" input.
+          if [ -n "${{ inputs.app }}" ]; then
+            context="${repo_dir}/apps/${{ inputs.app }}"
+            image_suffix="-${{ inputs.app }}"
+          else
+            context="${repo_dir}"
+            image_suffix=""
+          fi
+
+          echo "Build context: ${context}"
+
+          # Determine image name based on branch or tag, and include app suffix if available.
+          if [ "${GITHUB_REF_TYPE}" = 'branch' ] && echo "${GITHUB_REF_NAME}" | grep -q '^\(dev\|main\|test\)$'; then
+            image="registry.cmctech.pro/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}${image_suffix}"
+            docker build ${{ inputs.build_args }} --compress --pull --tag="${image}" "${context}"
+            docker push "${image}"
+          elif [ "${GITHUB_REF_TYPE}" = 'branch' ] && echo "${GITHUB_REF_NAME}" | grep -q '^[0-9]\+\.[0-9]\+\.x$'; then
+            image="registry.cmctech.pro/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}${image_suffix}"
+            if [ "${{ inputs.cache }}" != 'true' ]; then
+              docker build ${{ inputs.build_args }} --compress --pull --tag="${image}" "${context}"
+            elif docker pull "${image}"; then
+              docker build ${{ inputs.build_args }} --compress --cache-from="${image}" --tag="${image}" "${context}"
+            else
+              docker build ${{ inputs.build_args }} --compress --tag="${image}" "${context}"
+            fi
+            docker push "${image}"
+          elif [ "${GITHUB_REF_TYPE}" = 'tag' ] && echo "${GITHUB_REF_NAME}" | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+\(-[a-z]\+\)\?$'; then
+            cache_tag=$(echo "${GITHUB_REF_NAME}" | sed 's/^\([0-9]\+\.[0-9]\+\)\.[0-9]\+$/\1.x/')
+            cache_image="registry.cmctech.pro/${GITHUB_REPOSITORY}:${cache_tag}${image_suffix}"
+            image="registry.cmctech.pro/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}${image_suffix}"
+            if [ "${{ inputs.cache }}" != 'true' ]; then
+              docker build ${{ inputs.build_args }} --compress --pull --tag="${image}" "${context}"
+            elif docker pull "${cache_image}"; then
+              docker build ${{ inputs.build_args }} --compress --cache-from="${cache_image}" --tag="${image}" "${context}"
+            else
+              docker build ${{ inputs.build_args }} --compress --tag="${image}" "${context}"
+            fi
+            docker push "${image}"
+          elif [ "${GITHUB_REF_TYPE}" = 'tag' ] && echo "${GITHUB_REF_NAME}" | grep -q '^test-[0-9a-f]\{7\}$'; then
+            image="registry.cmctech.pro/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}${image_suffix}"
+            if [ "${{ inputs.cache }}" != 'true' ]; then
+              docker build ${{ inputs.build_args }} --compress --pull --tag="${image}" "${context}"
+            else
+              docker build ${{ inputs.build_args }} --compress --tag="${image}" "${context}"
+            fi
+            docker push "${image}"
+          else
+            if [ "${{ inputs.cache }}" != 'true' ]; then
+              docker build ${{ inputs.build_args }} --compress --pull "${context}"
+            else
+              docker build ${{ inputs.build_args }} --compress "${context}"
+            fi
+          fi
